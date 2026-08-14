@@ -869,88 +869,124 @@ def get_random_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:8]}"
 
 
-def get_refs_with_offsets(element: Tag) -> list[dict[str, Any]]:
-    """Extract references with their text offsets from an element."""
-    refs: list[dict[str, Any]] = []
+def get_refs_with_offsets(element):
+    """Extract references with their text offsets from an element.
+    
+    Uses a deterministic character-level index map from raw to cleaned text,
+    so offsets are always exact — no fuzzy search needed.
+    """
+    refs = []
 
-    # Apply the same text cleaning as get_formatted_passage
-    def _clean_text(text: str) -> str:
+    def _clean_text(text):
         if not text:
             return ""
         text = re.sub(r'\s+', ' ', text.strip())
-        text = html.unescape(text)
+        # DO NOT call html.unescape(text). BeautifulSoup get_text() already unescapes 
+        # standard XML entities. Calling html.unescape causes aggressive conversion of 
+        # malformed text (e.g., "&ltniss" without semicolon -> "<niss"), which shrinks 
+        # the string and silently breaks all subsequent offsets.
         return text
 
-    # Now extract references with offsets based on the cleaned text
-    def traverse_and_collect(node: Any, current_pos: int = 0) -> tuple[str, int]:
+    def _build_clean_map(raw_text):
+        """Build cleaned text and a mapping array: raw_map[raw_idx] -> cleaned_idx.
+        
+        Mimics the exact same cleaning as _clean_text:
+          1. strip leading/trailing whitespace
+          2. collapse internal whitespace runs to single space
+        (html.unescape is applied afterwards to the final string)
         """
-        Recursively traverse the DOM tree, building cleaned text content and tracking exact positions.
-        Returns tuple: (text_content, next_position)
-        """
+        n = len(raw_text)
+        raw_map = [0] * (n + 1)
+
+        # Find boundaries for strip()
+        left = 0
+        while left < n and raw_text[left].isspace():
+            left += 1
+        right = n - 1
+        while right >= 0 and raw_text[right].isspace():
+            right -= 1
+
+        if left > right:
+            return "", raw_map
+
+        out_chars = []
+        ci = 0       # current index in cleaned text
+        in_ws = False
+
+        for i in range(n):
+            if i < left or i > right:
+                raw_map[i] = ci
+                continue
+            ch = raw_text[i]
+            if ch.isspace():
+                if not in_ws:
+                    out_chars.append(' ')
+                    raw_map[i] = ci
+                    ci += 1
+                    in_ws = True
+                else:
+                    raw_map[i] = ci
+            else:
+                out_chars.append(ch)
+                raw_map[i] = ci
+                ci += 1
+                in_ws = False
+
+        raw_map[n] = ci
+        return "".join(out_chars), raw_map
+
+    def traverse(node, pos=0):
+        """Walk the DOM tree in document order, collecting raw text positions for refs."""
         if hasattr(node, 'name') and node.name:
-            # This is an element node
             if node.name == "ref" and node.get("type") == "bibr":
-                # Found a reference - get its cleaned text and record its exact position
-                ref_text = _clean_text(node.get_text())
-                if ref_text:  # Only record non-empty references
+                ref_text = node.get_text()
+                if ref_text.strip():
                     refs.append({
                         "type": node.get("type", ""),
                         "target": node.get("target", ""),
-                        "text": ref_text,
-                        "offset_start": current_pos,
-                        "offset_end": current_pos + len(ref_text)
+                        "raw_text": ref_text,
+                        "raw_start": pos,
+                        "raw_end": pos + len(ref_text),
                     })
-                # Return the cleaned reference text and advance position
-                return ref_text, current_pos + len(ref_text)
+                return ref_text, pos + len(ref_text)
             else:
-                # Process children in document order and accumulate their cleaned text
-                text_parts = []
-                pos = current_pos
+                parts = []
                 for child in node.children:
-                    child_text, new_pos = traverse_and_collect(child, pos)
+                    child_text, pos = traverse(child, pos)
                     if child_text is not None:
-                        text_parts.append(child_text)
-                    pos = new_pos
-                return "".join(text_parts), pos
+                        parts.append(child_text)
+                return "".join(parts), pos
         else:
-            # This is a text node (NavigableString) - be more careful with cleaning
-            text_content = str(node)
+            s = str(node)
+            return s, pos + len(s)
 
-            # For text nodes, we need to be more careful about whitespace
-            # Only apply the full cleaning at the end for the complete text
-            return text_content, current_pos + len(text_content)
+    # 1. Collect raw text and raw ref positions
+    raw_text, _ = traverse(element, 0)
 
-    # Build raw text with accurate positions first
-    raw_text, _ = traverse_and_collect(element, 0)
+    # 2. Build the index map
+    cleaned, raw_map = _build_clean_map(raw_text)
 
-    # Now apply the same cleaning as get_formatted_passage to the complete text
-    final_text = _clean_text(raw_text)
-
-    # Adjust all reference offsets to match the cleaned text
-    final_refs: list[dict[str, Any]] = []
+    # 3. Map each ref's raw offsets to cleaned offsets (deterministic, no search)
+    final_refs = []
     for ref in refs:
-        # Find the reference text in the cleaned text to get correct offsets
-        ref_text = ref['text']
+        mapped_start = raw_map[ref["raw_start"]]
+        mapped_end   = raw_map[ref["raw_end"]]
+        
+        # Extract the text directly from the cleaned string using the precise offsets.
+        # This absolutely guarantees that struct['text'][start:end] == ref['text'].
+        exact_text = cleaned[mapped_start:mapped_end]
 
-        # The reference text was also cleaned, so we need to find it in the final cleaned text
-        # We can search around the original position to find the correct occurrence
-        search_start = max(0, ref['offset_start'] - 10)  # Look a bit before the original position
-        search_end = min(len(final_text), ref['offset_end'] + 10)  # Look a bit after
-        search_area = final_text[search_start:search_end]
+        # Sometimes a ref is entirely whitespace and gets collapsed to empty string
+        if not exact_text.strip():
+            continue
 
-        # Find the reference in the search area
-        relative_pos = search_area.find(ref_text)
-        if relative_pos != -1:
-            final_start = search_start + relative_pos
-            final_end = final_start + len(ref_text)
-
-            final_refs.append({
-                "type": ref["type"],
-                "target": ref["target"],
-                "text": ref_text,
-                "offset_start": final_start,
-                "offset_end": final_end
-            })
+        final_refs.append({
+            "type": ref["type"],
+            "target": ref["target"],
+            "text": exact_text,
+            "offset_start": mapped_start,
+            "offset_end": mapped_end,
+        })
 
     return final_refs
 
@@ -962,7 +998,7 @@ def get_formatted_passage(head_paragraph: str | None, head_section: str | None, 
         if not text:
             return ""
         text = re.sub(r'\s+', ' ', text.strip())
-        text = html.unescape(text)
+        # DO NOT call html.unescape(text) here either, to maintain parity and prevent offset corruption.
         return text
 
     text = _clean_text_local(element.get_text())
@@ -1060,3 +1096,4 @@ def xml_table_to_json(table_element: Tag | None) -> dict[str, Any] | None:
 def convert_tei_file(tei_file: Union[str, Path, BinaryIO], stream: bool = False) -> Any:
     converter = TEI2LossyJSONConverter()
     return converter.convert_tei_file(tei_file, stream=stream)
+
