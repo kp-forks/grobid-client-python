@@ -233,41 +233,42 @@ class TestGrobidClient:
 
                 assert result == (True, 200)
 
-    @patch('os.walk')
-    def test_process_no_files_found(self, mock_walk):
+    def test_process_no_files_found(self):
         """Test process method when no eligible files are found."""
-        mock_walk.return_value = [('/test/path', [], [])]
-
-        with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
-            with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
-                client = GrobidClient(check_server=False)
-                client.logger = Mock()
-
-                client.process('processFulltextDocument', '/test/path')
-
-                client.logger.warning.assert_called_with('No eligible files found in /test/path')
-
-    @patch('os.walk')
-    @patch('builtins.print')  # Mock print since we use print for statistics
-    def test_process_with_pdf_files(self, mock_print, mock_walk):
-        """Test process method with PDF files."""
-        mock_walk.return_value = [
-            ('/test/path', [], ['doc1.pdf', 'doc2.PDF', 'not_pdf.txt'])
-        ]
-
-        with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
-            with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
-                with patch('grobid_client.grobid_client.GrobidClient.process_batch') as mock_batch:
-                    mock_batch.return_value = (2, 0, 0)  # Return tuple as expected (processed, errors, skipped)
+        with tempfile.TemporaryDirectory() as empty_dir:
+            with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
+                with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
                     client = GrobidClient(check_server=False)
                     client.logger = Mock()
 
-                    client.process('processFulltextDocument', '/test/path')
+                    client.process('processFulltextDocument', empty_dir)
 
-                    mock_batch.assert_called_once()
-                    # Check that print was called for statistics
-                    print_calls = [call[0][0] for call in mock_print.call_args_list if 'Found' in call[0][0]]
-                    assert any('Found 2 file(s) to process' in call for call in print_calls)
+                    client.logger.warning.assert_called_with(
+                        f"No eligible files found in input(s): ['{empty_dir}']")
+
+    @patch('builtins.print')  # Mock print since we use print for statistics
+    def test_process_with_pdf_files(self, mock_print):
+        """Test process method with PDF files (directory input)."""
+        with tempfile.TemporaryDirectory() as input_dir:
+            for name in ('doc1.pdf', 'doc2.PDF', 'not_pdf.txt'):
+                with open(os.path.join(input_dir, name), 'wb') as f:
+                    f.write(b'x')
+
+            with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
+                with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
+                    with patch('grobid_client.grobid_client.GrobidClient.process_batch') as mock_batch:
+                        mock_batch.return_value = (2, 0, 0)  # (processed, errors, skipped)
+                        client = GrobidClient(check_server=False)
+                        client.logger = Mock()
+
+                        client.process('processFulltextDocument', input_dir)
+
+                        mock_batch.assert_called_once()
+                        # only the 2 PDFs are batched, the .txt is ignored
+                        batched = mock_batch.call_args.args[1]
+                        assert len(batched) == 2
+                        print_calls = [call[0][0] for call in mock_print.call_args_list if 'Found' in call[0][0]]
+                        assert any('Found 2 local file(s) to process' in call for call in print_calls)
 
     @patch('builtins.open', new_callable=mock_open)
     @patch('grobid_client.grobid_client.GrobidClient.post')
@@ -671,3 +672,350 @@ class TestEdgeCases:
         result = client.get_server_url(service)
         expected = 'http://localhost:8070/api/processCitationPatentST36'
         assert result == expected
+
+
+class TestArchiveInput:
+    """Tests for streaming zip/tar archives as input (process_archive)."""
+
+    def _client(self, batch_size=2):
+        with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
+            with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
+                client = GrobidClient(check_server=False)
+        client.logger = Mock()
+        client.config['batch_size'] = batch_size
+        return client
+
+    @staticmethod
+    def _make_zip(path, entries):
+        import zipfile
+        with zipfile.ZipFile(path, 'w') as z:
+            for name, data in entries.items():
+                z.writestr(name, data)
+
+    @staticmethod
+    def _make_targz(path, entries, work):
+        import tarfile
+        with tarfile.open(path, 'w:gz') as t:
+            for name, data in entries.items():
+                member_path = os.path.join(work, os.path.basename(name))
+                with open(member_path, 'wb') as f:
+                    f.write(data)
+                t.add(member_path, arcname=name)
+
+    def _run(self, client, archive, output):
+        """Run archive processing with a fake GROBID post; return set of temp dirs used."""
+        temp_dirs = set()
+
+        def fake_post(url, files=None, data=None, headers=None, timeout=None):
+            temp_dirs.add(os.path.dirname(files['input'][0]))
+            resp = Mock()
+            resp.text = '<TEI>ok</TEI>'
+            return (resp, 200)
+
+        with patch.object(GrobidClient, 'post', side_effect=fake_post):
+            client.process('processFulltextDocument', archive, output=output, force=True)
+        return temp_dirs
+
+    @staticmethod
+    def _tei_outputs(output_dir):
+        found = []
+        for root, _, files in os.walk(output_dir):
+            for f in files:
+                if f.endswith('.grobid.tei.xml'):
+                    found.append(f)
+        return sorted(found)
+
+    def test_is_archive(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            zip_path = os.path.join(d, 'x.zip')
+            self._make_zip(zip_path, {'a.pdf': b'%PDF'})
+            assert client._is_archive(zip_path) is True
+            assert client._is_archive(d) is False  # directory
+            assert client._is_archive(os.path.join(d, 'missing.zip')) is False
+
+    def test_archive_stem(self):
+        client = self._client()
+        assert client._archive_stem('/x/docs.tar.gz') == '/x/docs'
+        assert client._archive_stem('/x/docs.tgz') == '/x/docs'
+        assert client._archive_stem('/x/docs.zip') == '/x/docs'
+
+    def test_safe_member_path_blocks_traversal(self):
+        client = self._client()
+        dest = os.path.join('some', 'dest')
+        # traversal and absolute paths are neutralized to stay under dest
+        assert client._safe_member_path(dest, '../../etc/passwd') == os.path.join(dest, 'etc', 'passwd')
+        assert client._safe_member_path(dest, '/abs/evil.pdf') == os.path.join(dest, 'abs', 'evil.pdf')
+        assert client._safe_member_path(dest, '') is None
+        assert client._safe_member_path(dest, '.') is None
+
+    def test_process_zip_streams_all_pdfs(self):
+        client = self._client(batch_size=2)
+        with tempfile.TemporaryDirectory() as d:
+            zip_path = os.path.join(d, 'docs.zip')
+            self._make_zip(zip_path, {
+                'a.pdf': b'%PDF-a',
+                'sub/b.pdf': b'%PDF-b',
+                'c.PDF': b'%PDF-c',
+                'ignore.txt': b'not a pdf',
+            })
+            out = os.path.join(d, 'out')
+            temp_dirs = self._run(client, zip_path, out)
+
+            # all 3 PDFs processed, the .txt ignored
+            assert self._tei_outputs(out) == ['a.grobid.tei.xml', 'b.grobid.tei.xml', 'c.grobid.tei.xml']
+            # 3 files with batch_size 2 => 2 chunks => distinct temp dirs, all cleaned up
+            assert len(temp_dirs) >= 2
+            assert all(not os.path.exists(td) for td in temp_dirs)
+
+    def test_process_targz(self):
+        client = self._client(batch_size=10)
+        with tempfile.TemporaryDirectory() as d:
+            tar_path = os.path.join(d, 'docs.tar.gz')
+            self._make_targz(tar_path, {'x.pdf': b'%PDF-x', 'nested/y.pdf': b'%PDF-y'}, d)
+            out = os.path.join(d, 'out')
+            temp_dirs = self._run(client, tar_path, out)
+            assert self._tei_outputs(out) == ['x.grobid.tei.xml', 'y.grobid.tei.xml']
+            assert all(not os.path.exists(td) for td in temp_dirs)
+
+    def test_process_routes_archive_to_core(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            zip_path = os.path.join(d, 'docs.zip')
+            self._make_zip(zip_path, {'a.pdf': b'%PDF'})
+            with patch.object(GrobidClient, '_process_archive_core', return_value=(1, 1, 0, 0)) as mock_core:
+                client.process('processFulltextDocument', zip_path, output=os.path.join(d, 'o'))
+                mock_core.assert_called_once()
+                assert mock_core.call_args.args[1] == zip_path
+
+    def test_process_zip_default_output_named_after_archive(self):
+        client = self._client(batch_size=10)
+        with tempfile.TemporaryDirectory() as d:
+            zip_path = os.path.join(d, 'mydocs.zip')
+            self._make_zip(zip_path, {'a.pdf': b'%PDF'})
+            self._run(client, zip_path, None)  # no output -> defaults to <stem>
+            assert self._tei_outputs(os.path.join(d, 'mydocs')) == ['a.grobid.tei.xml']
+
+    def test_empty_archive_warns(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            zip_path = os.path.join(d, 'empty.zip')
+            self._make_zip(zip_path, {'notes.txt': b'no pdfs here'})
+            with patch.object(GrobidClient, 'process_batch') as mock_batch:
+                client.process('processFulltextDocument', zip_path, output=os.path.join(d, 'o'))
+                mock_batch.assert_not_called()
+            client.logger.warning.assert_called()
+
+
+class TestGlobInput:
+    """Tests for glob-pattern input resolution (--input as a glob)."""
+
+    def _client(self, batch_size=50):
+        with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
+            with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
+                client = GrobidClient(check_server=False)
+        client.logger = Mock()
+        client.config['batch_size'] = batch_size
+        return client
+
+    @staticmethod
+    def _zip(path, entries):
+        import zipfile
+        with zipfile.ZipFile(path, 'w') as z:
+            for name, data in entries.items():
+                z.writestr(name, data)
+
+    @staticmethod
+    def _tei_outputs(output_dir):
+        found = []
+        for root, _, files in os.walk(output_dir):
+            for f in files:
+                if f.endswith('.grobid.tei.xml'):
+                    found.append(f)
+        return sorted(found)
+
+    def _run(self, client, pattern, output):
+        def fake_post(url, files=None, data=None, headers=None, timeout=None):
+            resp = Mock()
+            resp.text = '<TEI>ok</TEI>'
+            return (resp, 200)
+        with patch.object(GrobidClient, 'post', side_effect=fake_post):
+            client.process('processFulltextDocument', pattern, output=output, force=True)
+
+    def test_resolve_input_paths_plain_and_glob(self):
+        client = self._client()
+        # plain path (no magic) returned as-is even if missing
+        assert client._resolve_input_paths('/nope/x.zip') == ['/nope/x.zip']
+        with tempfile.TemporaryDirectory() as d:
+            for n in ('paper1.zip', 'paper2.zip', 'other.zip'):
+                open(os.path.join(d, n), 'wb').close()
+            matches = client._resolve_input_paths(os.path.join(d, 'paper*.zip'))
+            assert [os.path.basename(m) for m in matches] == ['paper1.zip', 'paper2.zip']
+
+    def test_glob_matches_multiple_archives(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            self._zip(os.path.join(d, 'paper1.zip'), {'a.pdf': b'%PDF-a'})
+            self._zip(os.path.join(d, 'paper2.zip'), {'b.pdf': b'%PDF-b'})
+            self._zip(os.path.join(d, 'skip.zip'), {'c.pdf': b'%PDF-c'})
+            out = os.path.join(d, 'out')
+            self._run(client, os.path.join(d, 'paper*.zip'), out)
+            # only paper1/paper2 archives, skip.zip excluded by the pattern
+            assert self._tei_outputs(out) == ['a.grobid.tei.xml', 'b.grobid.tei.xml']
+
+    def test_glob_recursive_pdfs_across_subdirs(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, 'sub1'))
+            os.makedirs(os.path.join(d, 'sub2'))
+            open(os.path.join(d, 'sub1', 'a.pdf'), 'wb').close()
+            open(os.path.join(d, 'sub2', 'b.pdf'), 'wb').close()
+            open(os.path.join(d, 'sub2', 'note.txt'), 'wb').close()
+            out = os.path.join(d, 'out')
+            self._run(client, os.path.join(d, '**', '*.pdf'), out)
+            assert self._tei_outputs(out) == ['a.grobid.tei.xml', 'b.grobid.tei.xml']
+
+    def test_glob_no_match_warns(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            client.process('processFulltextDocument', os.path.join(d, 'nothing*.zip'),
+                           output=os.path.join(d, 'o'))
+            client.logger.warning.assert_called()
+            assert "No files match" in client.logger.warning.call_args[0][0]
+
+    def test_common_base_is_ancestor(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            f1 = os.path.join(d, 'x', 'a.pdf')
+            f2 = os.path.join(d, 'y', 'b.pdf')
+            os.makedirs(os.path.dirname(f1)); os.makedirs(os.path.dirname(f2))
+            open(f1, 'wb').close(); open(f2, 'wb').close()
+            base = client._common_base([f1, f2])
+            assert os.path.isdir(base)
+            assert f1.startswith(base) and f2.startswith(base)
+
+
+class TestAtomicWrite:
+    """A killed task must never leave a partial output that resume accepts.
+
+    process_batch decides a document is done with os.path.isfile() alone, so a
+    TEI truncated by an OOM kill is skipped forever on subsequent runs. These
+    tests pin the two properties that prevent it: a completed write is whole,
+    and a failed write leaves nothing behind at all.
+    """
+
+    def _client(self):
+        with patch('grobid_client.grobid_client.GrobidClient._test_server_connection'):
+            with patch('grobid_client.grobid_client.GrobidClient._configure_logging'):
+                client = GrobidClient(check_server=False)
+        client.logger = Mock()
+        return client
+
+    @staticmethod
+    def _leftovers(directory):
+        """Temp files the writer may have leaked (they are dot-prefixed)."""
+        return [n for n in os.listdir(directory) if n.startswith('.') and n.endswith('.tmp')]
+
+    def test_write_lands_content(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, 'a.grobid.tei.xml')
+            client._write_atomic(dest, '<TEI>content</TEI>')
+            with open(dest, encoding='utf8') as fh:
+                assert fh.read() == '<TEI>content</TEI>'
+            assert self._leftovers(d) == []
+
+    def test_write_creates_missing_parents(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, 'sub', 'dir', 'a.grobid.tei.xml')
+            client._write_atomic(dest, 'x')
+            assert os.path.isfile(dest)
+
+    def test_write_overwrites_existing(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, 'a.grobid.tei.xml')
+            client._write_atomic(dest, 'old and much longer')
+            client._write_atomic(dest, 'new')
+            with open(dest, encoding='utf8') as fh:
+                assert fh.read() == 'new'
+
+    def test_failed_write_leaves_no_destination(self):
+        """The whole point: a write that dies part-way must not create the output.
+
+        Simulates the real failure -- some bytes reach the disk, then the
+        process dies -- by writing a prefix and raising, as an OOM kill would.
+        """
+        client = self._client()
+        real_fdopen = os.fdopen
+
+        class PartialWriter:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                self._handle.close()
+                return False
+
+            def write(self, text):
+                self._handle.write(text[:4])       # bytes hit the disk...
+                raise RuntimeError('killed mid-write')   # ...then the task dies
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, 'a.grobid.tei.xml')
+            with patch('os.fdopen', lambda fd, *a, **kw: PartialWriter(real_fdopen(fd, *a, **kw))):
+                with pytest.raises(RuntimeError):
+                    client._write_atomic(dest, '<TEI>content</TEI>')
+
+            assert not os.path.exists(dest), \
+                "a partial write created the destination -- resume would skip it forever"
+            assert self._leftovers(d) == [], "temp file was left behind"
+
+    def test_failed_write_preserves_previous_content(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, 'a.grobid.tei.xml')
+            client._write_atomic(dest, 'good')
+            with patch('os.replace', side_effect=OSError('boom')):
+                with pytest.raises(OSError):
+                    client._write_atomic(dest, 'bad')
+            with open(dest, encoding='utf8') as fh:
+                assert fh.read() == 'good'
+            assert self._leftovers(d) == []
+
+    def test_temp_name_is_not_counted_as_output(self):
+        """grobid_stream.sh counts *.grobid.tei.xml and *_[0-9]*.txt via find.
+
+        An in-flight temp file must match neither, or the tallies move while a
+        write is happening.
+        """
+        import fnmatch
+        client = self._client()
+        seen = {}
+        real_mkstemp = tempfile.mkstemp
+
+        def spy(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            seen['name'] = os.path.basename(path)
+            return fd, path
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch('tempfile.mkstemp', side_effect=spy):
+                client._write_atomic(os.path.join(d, 'a.grobid.tei.xml'), 'x')
+        assert not fnmatch.fnmatch(seen['name'], '*.grobid.tei.xml')
+        assert not fnmatch.fnmatch(seen['name'], '*_[0-9]*.txt')
+
+    def test_write_uses_normal_permissions(self):
+        """mkstemp creates 0600; TEIs on shared scratch must stay group-readable."""
+        client = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            reference = os.path.join(d, 'reference.txt')
+            with open(reference, 'w') as fh:      # what the old code produced
+                fh.write('x')
+            dest = os.path.join(d, 'a.grobid.tei.xml')
+            client._write_atomic(dest, 'x')
+            assert (os.stat(dest).st_mode & 0o777) == (os.stat(reference).st_mode & 0o777)

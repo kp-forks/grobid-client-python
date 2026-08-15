@@ -34,6 +34,8 @@ concurrent processing capabilities for PDF documents, reference strings, and pat
 - **JSON Output**: Convert TEI XML output to structured JSON format with CORD-19-like structure
 - **Markdown Output**: Convert TEI XML output to clean Markdown format with structured sections
 - **Type Hints**: Ships inline type annotations and a `py.typed` marker (PEP 561) for static type checking
+- **Archive Streaming**: Process files directly from `.zip`/`.tar`/`.tar.gz` archives without fully decompressing them
+- **S3 Streaming**: Read PDFs and zips straight from `s3://` (range-streamed, no full download) with the optional `[s3]` extra
 
 ## 📋 Prerequisites
 
@@ -58,6 +60,9 @@ Choose one of the following installation methods:
 
 ```bash
 pip install grobid-client-python
+
+# to stream inputs directly from S3 (s3:// URIs), install the optional 's3' extra:
+pip install "grobid-client-python[s3]"
 ```
 
 ### Development Version
@@ -167,7 +172,36 @@ grobid_client --server https://grobid.example.com --input ~/citations.txt proces
 
 # Force reprocessing with sentence segmentation and JSON output
 grobid_client --input ~/docs --force --segment_sentences --json processFulltextDocument
+
+# Process PDFs directly from a zip or tar.gz archive (streamed, not fully decompressed)
+grobid_client --input ~/papers.zip --output ~/results processFulltextDocument
+grobid_client --input ~/papers.tar.gz --output ~/results processFulltextDocument
+
+# --input also accepts glob patterns (quote them so the shell does not expand them)
+grobid_client --input "~/papers/*.zip"    --output ~/results processFulltextDocument   # many archives
+grobid_client --input "~/data/**/*.pdf"   --output ~/results processFulltextDocument   # PDFs in subdirectories
 ```
+
+> [!NOTE]
+> `--input` accepts a directory, a single file, an **archive**, or a **glob pattern**:
+> - **Archives** (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) are streamed: eligible entries are extracted in
+>   chunks of `batch_size` to a temporary directory, sent to GROBID, written to `--output`, and deleted before the next
+>   chunk. The archive is never fully decompressed, so disk usage stays bounded. If `--output` is omitted, results go to a
+>   directory named after the archive (e.g. `papers.zip` → `papers/`).
+> - **Glob patterns** (`paper.zip`, `paper*.zip`, `**/paper*.zip`, `**/*.pdf`, …) are expanded with `**` recursion; each
+>   match is handled by type (archive → streamed, directory → recursed, file → processed). Quote the pattern so your shell
+>   passes it through to the client unexpanded.
+> - **S3** (requires `pip install "grobid-client-python[s3]"`): pass an `s3://` object, prefix or glob. A remote zip is
+>   **range-streamed** (only its central directory and the entries are fetched — never the whole object); loose remote
+>   PDFs are fetched a batch at a time. Credentials use the standard AWS chain (env vars / `~/.aws` / IAM role).
+>   ```bash
+>   grobid_client --input "s3://my-bucket/papers/2021.zip"  --output ~/out processFulltextDocument   # one remote zip
+>   grobid_client --input "s3://my-bucket/pdfs/*.pdf"        --output ~/out processFulltextDocument   # loose PDFs
+>   grobid_client --input "s3://my-bucket/zips/"             --output ~/out processFulltextDocument   # every object under a prefix
+>   ```
+>
+> A **manifest of paths** (local, glob or `s3://`, one per line, `#` comments allowed) can be processed together via
+> `--input-list paths.txt` (combinable with `--input`).
 
 ### Python Library
 
