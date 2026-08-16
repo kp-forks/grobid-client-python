@@ -17,6 +17,7 @@ which is not implemented for the moment.
 from __future__ import annotations
 
 import os
+import io
 import json
 import argparse
 import fnmatch
@@ -32,7 +33,7 @@ import shutil
 import tarfile
 import tempfile
 import zipfile
-from typing import Any, BinaryIO, Optional, Tuple, Union
+from typing import Any, BinaryIO, Callable, Optional, Tuple, Union
 import copy
 
 from .format.TEI2LossyJSON import TEI2LossyJSONConverter
@@ -81,6 +82,11 @@ class GrobidClient(ApiClient):
     # See https://github.com/grobidOrg/grobid-client-python/issues/119
     TEI_SUFFIX = ".grobid.tei.xml"
     ERROR_FILE_RE = re.compile(r"_\d{3}\.txt$")
+
+    # Name given to a PDF that is passed as bytes and left unnamed by the caller.
+    # A multipart part needs a filename, and GROBID echoes it in its own logs and
+    # error messages, so an anonymous document should still be recognisable.
+    DEFAULT_IN_MEMORY_NAME = "document.pdf"
 
     # Default configuration values
     DEFAULT_CONFIG: dict = {
@@ -366,6 +372,45 @@ class GrobidClient(ApiClient):
             self.logger.error(error_msg)
             raise ServerUnavailableException(error_msg) from e
 
+    def _warn_on_engine_concurrency(self, n: int) -> None:
+        """Preflight for in-memory runs: compare client concurrency to the server pool.
+
+        An in-memory run keeps up to ``n`` documents in flight against the
+        server, so asking for more concurrency than the server has engines only
+        piles up requests that queue there or come back as 503, while asking
+        for less leaves engines idle. The pool size comes from ``/api/health``
+        (``pool.maxActive``); a server without that endpoint (older GROBID) or
+        an unreadable answer is left alone - this is advisory, not a gate.
+        """
+        try:
+            response = requests.get(self.get_server_url("health"), timeout=10)
+            payload = response.json()
+        except Exception as e:
+            self.logger.debug(f"Concurrency preflight skipped, /api/health not readable: {str(e)}")
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        if payload.get("ready") is False:
+            self.logger.warning(
+                f"GROBID server {self.config['grobid_server']} reports it is not ready (/api/health)")
+
+        pool = payload.get("pool")
+        max_active = pool.get("maxActive") if isinstance(pool, dict) else None
+        if not isinstance(max_active, int) or max_active <= 0:
+            return
+
+        if n > max_active:
+            self.logger.warning(
+                f"Client concurrency {n} exceeds the {max_active} engine(s) of the GROBID server: "
+                f"the surplus requests will queue on the server or be retried on 503. "
+                f"Consider n={max_active}, or raising 'concurrency' in the server's grobid.yaml.")
+        elif n < max_active:
+            self.logger.info(
+                f"The GROBID server has {max_active} engines but the client concurrency is only {n}; "
+                f"n={max_active} would use them all.")
+
     def _output_file_name(
             self,
             input_file: str,
@@ -580,6 +625,12 @@ class GrobidClient(ApiClient):
             self.logger.warning(f"No eligible files found in input(s): {inputs}")
             return
 
+        # Archives and remote files are about to be processed from memory with
+        # up to n documents in flight, so check upfront that the server has the
+        # engines to take them (citation lists take the disk route instead).
+        if (archive_paths or remote_files) and service != 'processCitationList':
+            self._warn_on_engine_concurrency(n)
+
         processed_files_count = 0
         errors_files_count = 0
         skipped_files_count = 0
@@ -600,7 +651,7 @@ class GrobidClient(ApiClient):
             skipped_files_count += bs
             total_files += len(fs_files)
 
-        # Loose remote (s3) files: streamed to a temp dir one chunk at a time
+        # Loose remote (s3) files: streamed into memory one chunk at a time
         if remote_files:
             rt, rp, re_count, rs = self._process_remote_files(
                 service, remote_files, output, n,
@@ -955,6 +1006,34 @@ class GrobidClient(ApiClient):
 
         return target
 
+    def _read_archive_member(self, kind: str, archive: Any, member_name: str) -> Optional[BinaryIO]:
+        """Read a single archive entry into memory as a named document.
+
+        The entry never touches the disk: it goes straight from the archive to
+        process_pdf, which accepts a named stream. The stream is named after the
+        entry (sanitized the same way extraction is), and that name is what the
+        output file is derived from. Returns None if the entry is unusable.
+        """
+        name = self._safe_member_path("", member_name)
+        if name is None:
+            self.logger.warning(f"Skipping archive entry with unsafe path: {member_name}")
+            return None
+
+        if kind == "zip":
+            source = archive.open(member_name)
+        else:
+            source = archive.extractfile(archive.getmember(member_name))
+            if source is None:
+                return None
+
+        try:
+            document = io.BytesIO(source.read())
+        finally:
+            source.close()
+
+        document.name = name
+        return document
+
     def process_archive(
             self,
             service: str,
@@ -977,16 +1056,21 @@ class GrobidClient(ApiClient):
     ) -> None:
         """Process the eligible files contained in a zip/tar archive.
 
-        The archive is never fully decompressed: entries are streamed to a
-        temporary directory in chunks of ``batch_size`` (from the config), each
-        chunk is sent to GROBID via ``process_batch``, and the temporary files
-        are removed before the next chunk is extracted. This keeps disk usage
-        bounded regardless of the archive size. Output files follow the same
-        flat naming convention as directory processing (one ``<stem>`` per
-        result, in ``output``).
+        The archive is never fully decompressed: entries are read straight into
+        memory in chunks of ``batch_size`` (from the config) and each chunk is
+        sent to GROBID via ``process_batch``, so memory usage stays bounded by
+        the chunk size and nothing but the results ever touches the disk. (The
+        exception is ``processCitationList``, whose ``.txt`` inputs are read
+        from a path and therefore still go through a temporary directory.)
+        Output files follow the same flat naming convention as directory
+        processing (one ``<stem>`` per result, in ``output``).
         """
         start_time = time.time()
         self._warn_on_consolidation_timeout(consolidate_citations)
+
+        # Entries are about to be posted from memory with up to n in flight
+        if service != 'processCitationList':
+            self._warn_on_engine_concurrency(n)
 
         total_files, processed, errors, skipped = self._process_archive_core(
             service, archive_path, output, n, generate_ids, consolidate_header,
@@ -1062,8 +1146,51 @@ class GrobidClient(ApiClient):
 
             print(f"Found {total_files} file(s) to process in {archive_path}")
 
+            # Citation lists go through process_txt, which reads from a path, so
+            # they still take the extract-to-a-temp-dir route. Everything else is
+            # read straight from the archive into memory and posted from there.
+            use_disk = service == 'processCitationList'
+
             for chunk_start in range(0, total_files, batch_size_pdf):
                 chunk = eligible_members[chunk_start:chunk_start + batch_size_pdf]
+
+                if not use_disk:
+                    documents = []
+                    for member_name in chunk:
+                        if verbose:
+                            self.logger.info(f"Reading {member_name} from {archive_path}")
+                        document = self._read_archive_member(kind, archive, member_name)
+                        if document is not None:
+                            documents.append(document)
+
+                    if not documents:
+                        continue
+
+                    batch_processed, batch_errors, batch_skipped = self.process_batch(
+                        service,
+                        documents,
+                        ".",
+                        output,
+                        n,
+                        generate_ids,
+                        consolidate_header,
+                        consolidate_citations,
+                        include_raw_citations,
+                        include_raw_affiliations,
+                        tei_coordinates,
+                        segment_sentences,
+                        force,
+                        verbose,
+                        flavor,
+                        json_output,
+                        markdown_output,
+                        skip_errors=skip_errors
+                    )
+                    processed_files_count += batch_processed
+                    errors_files_count += batch_errors
+                    skipped_files_count += batch_skipped
+                    continue
+
                 temp_dir = tempfile.mkdtemp(prefix="grobid_archive_")
                 try:
                     extracted_files = []
@@ -1133,10 +1260,11 @@ class GrobidClient(ApiClient):
             markdown_output: bool,
             skip_errors: bool = False
     ) -> Tuple[int, int, int, int]:
-        """Stream loose remote (s3) files to a temp dir in chunks and process them.
+        """Stream loose remote (s3) files into memory in chunks and process them.
 
         Returns (total, processed, errors, skipped). Objects are fetched a
-        batch at a time and deleted before the next chunk, so disk stays bounded.
+        batch at a time straight into memory, so nothing is written to disk and
+        memory stays bounded by the chunk size.
         """
         total = len(uris)
         if total == 0:
@@ -1151,8 +1279,57 @@ class GrobidClient(ApiClient):
         error_count = 0
         skipped_count = 0
 
+        # Citation lists go through process_txt, which reads from a path, so
+        # they still take the download-to-a-temp-dir route. Everything else is
+        # fetched straight into memory and posted from there.
+        use_disk = service == 'processCitationList'
+
         for chunk_start in range(0, total, batch_size_pdf):
             chunk = uris[chunk_start:chunk_start + batch_size_pdf]
+
+            if not use_disk:
+                documents = []
+                for uri in chunk:
+                    if verbose:
+                        self.logger.info(f"Fetching {uri}")
+                    try:
+                        with self._s3_open(uri) as source:
+                            document = io.BytesIO(source.read())
+                    except Exception as e:
+                        self.logger.error(f"Failed to fetch {uri}: {str(e)}")
+                        error_count += 1
+                        continue
+                    document.name = self._s3_basename(uri)
+                    documents.append(document)
+
+                if not documents:
+                    continue
+
+                batch_processed, batch_errors, batch_skipped = self.process_batch(
+                    service,
+                    documents,
+                    ".",
+                    output,
+                    n,
+                    generate_ids,
+                    consolidate_header,
+                    consolidate_citations,
+                    include_raw_citations,
+                    include_raw_affiliations,
+                    tei_coordinates,
+                    segment_sentences,
+                    force,
+                    verbose,
+                    flavor,
+                    json_output,
+                    markdown_output,
+                    skip_errors=skip_errors
+                )
+                processed_count += batch_processed
+                error_count += batch_errors
+                skipped_count += batch_skipped
+                continue
+
             temp_dir = tempfile.mkdtemp(prefix="grobid_s3_")
             try:
                 local_files = []
@@ -1233,8 +1410,13 @@ class GrobidClient(ApiClient):
             # with concurrent.futures.ProcessPoolExecutor(max_workers=n) as executor:
             results = []
             for input_file in input_files:
+                # An entry is either a path or an in-memory document (a named
+                # stream, as fed by the archive/s3 streaming). Either way it goes
+                # by its name here, and process_pdf returns that same name, so
+                # the results below land on the same output file.
+                input_name = input_file if isinstance(input_file, str) else self._document_name(input_file)
                 # check if TEI file is already produced
-                filename = self._output_file_name(input_file, input_path, output)
+                filename = self._output_file_name(input_name, input_path, output)
                 if not force and os.path.isfile(filename):
                     self.logger.info(
                         f"{filename} already exists, skipping... (use --force to reprocess pdf input files)")
@@ -1290,7 +1472,7 @@ class GrobidClient(ApiClient):
                     previous_errors = self._find_error_files(filename)
                     if previous_errors:
                         self.logger.info(
-                            f"{input_file} previously failed ({os.path.basename(previous_errors[0])}), "
+                            f"{input_name} previously failed ({os.path.basename(previous_errors[0])}), "
                             f"skipping... (use --force to retry it)")
                         skipped_count += 1
                         continue
@@ -1300,7 +1482,7 @@ class GrobidClient(ApiClient):
                     selected_process = self.process_txt
 
                 if verbose:
-                    self.logger.info(f"Adding {input_file} to the queue")
+                    self.logger.info(f"Adding {input_name} to the queue")
 
                 r = executor.submit(
                     selected_process,
@@ -1404,7 +1586,75 @@ class GrobidClient(ApiClient):
     def process_pdf(
             self,
             service: str,
-            pdf_file: str,
+            pdf_file: Union[str, bytes, bytearray, memoryview, BinaryIO],
+            generate_ids: bool = False,
+            consolidate_header: bool = True,
+            consolidate_citations: bool = False,
+            include_raw_citations: bool = False,
+            include_raw_affiliations: bool = False,
+            tei_coordinates: bool = False,
+            segment_sentences: bool = False,
+            flavor: Optional[str] = None,
+            start: int = -1,
+            end: int = -1
+    ) -> Tuple[str, int, Optional[str]]:
+        """Send a single PDF to GROBID.
+
+        ``pdf_file`` is either a path to read from disk, or the document itself
+        already in memory - bytes, or any binary stream - for callers that got
+        the PDF from somewhere else than the filesystem: a database, an HTTP
+        response, an object store. They would otherwise have to write it out just
+        to have this client read it back.
+        See https://github.com/grobidOrg/grobid-client-python/pull/67
+
+        The document names itself: a path is its own name, and a stream is named
+        after its ``name`` attribute, which ``open()`` sets and which can be set
+        on anything else, ``io.BytesIO`` included:
+
+            pdf = io.BytesIO(downloaded_bytes)
+            pdf.name = "paper.pdf"
+
+        Bytes without a stream around them have nothing to be named after, so
+        they fall back to ``DEFAULT_IN_MEMORY_NAME``.
+
+        Returns:
+            tuple: (document name, status code, response text)
+        """
+        return self._process_named_pdf(
+            service, self._document_name(pdf_file), pdf_file, generate_ids,
+            consolidate_header, consolidate_citations, include_raw_citations,
+            include_raw_affiliations, tei_coordinates, segment_sentences,
+            flavor, start, end
+        )
+
+    def _document_name(self, pdf_file: Any) -> str:
+        """Name a document after itself: its path, or its stream's name."""
+        if isinstance(pdf_file, str):
+            return pdf_file
+        name = getattr(pdf_file, "name", None)
+        # A file opened from a descriptor has an int here, not a name
+        return name if isinstance(name, str) else self.DEFAULT_IN_MEMORY_NAME
+
+    def _pdf_opener(self, pdf_file: Any) -> Callable[[], BinaryIO]:
+        """Return a callable handing out a fresh stream over the document.
+
+        Not a stream but a way to get one: a 503 makes us send the same document
+        again, and a stream that has already been posted is sitting at its end.
+        Rewinding is not enough either - the caller's stream may not be seekable
+        - so a stream is read once, here, and re-served from memory afterwards.
+        """
+        if isinstance(pdf_file, str):
+            return lambda: open(pdf_file, "rb")
+        if isinstance(pdf_file, (bytes, bytearray, memoryview)):
+            return lambda: io.BytesIO(pdf_file)
+        content = pdf_file.read()
+        return lambda: io.BytesIO(content)
+
+    def _process_named_pdf(
+            self,
+            service: str,
+            name: str,
+            pdf_file: Any,
             generate_ids: bool,
             consolidate_header: bool,
             consolidate_citations: bool,
@@ -1416,13 +1666,43 @@ class GrobidClient(ApiClient):
             start: int = -1,
             end: int = -1
     ) -> Tuple[str, int, Optional[str]]:
-        pdf_handle = None
+        """Process a document under a name already decided by the caller."""
         try:
-            pdf_handle = open(pdf_file, "rb")
-            
+            open_handle = self._pdf_opener(pdf_file)
+        except Exception as e:
+            self.logger.error(f"Failed to read PDF {name}: {str(e)}")
+            return (name, 400, f"Failed to open file: {str(e)}")
+
+        return self._send_pdf(
+            service, name, open_handle, generate_ids, consolidate_header,
+            consolidate_citations, include_raw_citations, include_raw_affiliations,
+            tei_coordinates, segment_sentences, flavor, start, end
+        )
+
+    def _send_pdf(
+            self,
+            service: str,
+            name: str,
+            open_handle: Callable[[], BinaryIO],
+            generate_ids: bool,
+            consolidate_header: bool,
+            consolidate_citations: bool,
+            include_raw_citations: bool,
+            include_raw_affiliations: bool,
+            tei_coordinates: bool,
+            segment_sentences: bool,
+            flavor: Optional[str] = None,
+            start: int = -1,
+            end: int = -1
+    ) -> Tuple[str, int, Optional[str]]:
+        """Post one document, retrying it from a fresh stream on a 503."""
+        pdf_handle: Optional[BinaryIO] = None
+        try:
+            pdf_handle = open_handle()
+
             files = {
                 "input": (
-                    pdf_file,
+                    name,
                     pdf_handle,
                     "application/pdf",
                     {"Expires": "0"},
@@ -1461,10 +1741,11 @@ class GrobidClient(ApiClient):
 
             if status == 503:
                 return self._handle_server_busy_retry(
-                    pdf_file,
-                    self.process_pdf,
+                    name,
+                    self._send_pdf,
                     service,
-                    pdf_file,
+                    name,
+                    open_handle,
                     generate_ids,
                     consolidate_header,
                     consolidate_citations,
@@ -1477,21 +1758,115 @@ class GrobidClient(ApiClient):
                     end
                 )
 
-            return (pdf_file, status, res.text)
-        
+            return (name, status, res.text)
+
         except IOError as e:
-            self.logger.error(f"Failed to open PDF file {pdf_file}: {str(e)}")
-            return (pdf_file, 400, f"Failed to open file: {str(e)}")
+            self.logger.error(f"Failed to open PDF file {name}: {str(e)}")
+            return (name, 400, f"Failed to open file: {str(e)}")
         except requests.exceptions.ReadTimeout as e:
-            self.logger.error(f"Request timeout for {pdf_file}: {str(e)}")
-            return (pdf_file, 408, f"Request timeout: {str(e)}")
+            self.logger.error(f"Request timeout for {name}: {str(e)}")
+            return (name, 408, f"Request timeout: {str(e)}")
         except requests.exceptions.RequestException as e:
-            return self._handle_request_error(pdf_file, e)
+            return self._handle_request_error(name, e)
         except Exception as e:
-            return self._handle_unexpected_error(pdf_file, e)
+            return self._handle_unexpected_error(name, e)
         finally:
+            # Always ours to close: the caller's own stream is never kept, only
+            # the bytes read out of it.
             if pdf_handle:
                 pdf_handle.close()
+
+    def process_documents(
+            self,
+            service: str,
+            documents: Any,
+            n: int = 10,
+            generate_ids: bool = False,
+            consolidate_header: bool = True,
+            consolidate_citations: bool = False,
+            include_raw_citations: bool = False,
+            include_raw_affiliations: bool = False,
+            tei_coordinates: bool = False,
+            segment_sentences: bool = False,
+            flavor: Optional[str] = None,
+            verbose: bool = False
+    ) -> list:
+        """Process several documents concurrently and return their results.
+
+        ``process_pdf`` handles one document per call, so a caller holding a list
+        of PDFs would have to build its own thread pool to get any concurrency
+        out of the server. This runs them through the same ThreadPoolExecutor the
+        file-based processing uses, but writes nothing: use ``process()`` for the
+        directory-oriented processing that produces TEI files on disk.
+
+        Each document is whatever ``process_pdf`` accepts - a path, bytes, or a
+        stream - and names itself the same way. Unnamed documents (bare bytes)
+        are named after their position, so that every result stays identifiable.
+
+        Returns:
+            list: one ``(name, status code, response text)`` per document, in the
+            order the documents were given - not in completion order, so results
+            can be zipped back onto whatever the caller has them keyed by.
+            A document that fails does not stop the others: its own entry carries
+            the error status, as with the file-based processing.
+        """
+        items = self._name_documents(documents)
+        if not items:
+            self.logger.warning("No documents to process")
+            return []
+
+        if verbose:
+            self.logger.info(f"{len(items)} document(s) to process")
+
+        self._warn_on_engine_concurrency(max(1, n))
+
+        # A pool of one is still a pool: n < 1 would make ThreadPoolExecutor raise
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n)) as executor:
+            futures = [
+                executor.submit(
+                    self._process_named_pdf,
+                    service,
+                    name,
+                    document,
+                    generate_ids,
+                    consolidate_header,
+                    consolidate_citations,
+                    include_raw_citations,
+                    include_raw_affiliations,
+                    tei_coordinates,
+                    segment_sentences,
+                    flavor
+                )
+                for name, document in items
+            ]
+            # Collected in submission order rather than with as_completed():
+            # in-memory documents have no filenames to be matched back on later.
+            return [future.result() for future in futures]
+
+    def _name_documents(self, documents: Any) -> list:
+        """Pair every document with the name it will be known by.
+
+        Documents that name themselves (a path, a stream with a ``name``) keep
+        their own; the rest are numbered after their position, because a batch of
+        documents all called ``document.pdf`` could not be told apart in the
+        results or in GROBID's logs.
+        """
+        if isinstance(documents, (bytes, bytearray, memoryview)):
+            # Iterating a single PDF would yield its individual bytes, so catch
+            # the mistake here rather than sending thousands of empty documents.
+            raise TypeError(
+                "process_documents expects several documents; "
+                "use process_pdf for a single one"
+            )
+
+        items = []
+        stem, extension = os.path.splitext(self.DEFAULT_IN_MEMORY_NAME)
+        for position, document in enumerate(documents, start=1):
+            name = self._document_name(document)
+            if name == self.DEFAULT_IN_MEMORY_NAME:
+                name = f"{stem}-{position}{extension}"
+            items.append((name, document))
+        return items
 
     def get_server_url(self, service: str) -> str:
         return self.config['grobid_server'] + "/api/" + service

@@ -36,6 +36,7 @@ concurrent processing capabilities for PDF documents, reference strings, and pat
 - **Type Hints**: Ships inline type annotations and a `py.typed` marker (PEP 561) for static type checking
 - **Archive Streaming**: Process files directly from `.zip`/`.tar`/`.tar.gz` archives without fully decompressing them
 - **S3 Streaming**: Read PDFs and zips straight from `s3://` (range-streamed, no full download) with the optional `[s3]` extra
+- **In-Memory Documents**: Send PDFs held as bytes straight to GROBID, without writing them to disk first
 
 ## 📋 Prerequisites
 
@@ -188,16 +189,17 @@ grobid_client --input "~/data/**/*.pdf"   --output ~/results processFulltextDocu
 
 > [!NOTE]
 > `--input` accepts a directory, a single file, an **archive**, or a **glob pattern**:
-> - **Archives** (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) are streamed: eligible entries are extracted in
->   chunks of `batch_size` to a temporary directory, sent to GROBID, written to `--output`, and deleted before the next
->   chunk. The archive is never fully decompressed, so disk usage stays bounded. If `--output` is omitted, results go to a
->   directory named after the archive (e.g. `papers.zip` → `papers/`).
+> - **Archives** (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`) are streamed: eligible entries are read into
+>   memory in chunks of `batch_size` and sent to GROBID straight from there — the archive is never fully decompressed and
+>   nothing but the results in `--output` ever touches the disk. If `--output` is omitted, results go to a directory named
+>   after the archive (e.g. `papers.zip` → `papers/`).
 > - **Glob patterns** (`paper.zip`, `paper*.zip`, `**/paper*.zip`, `**/*.pdf`, …) are expanded with `**` recursion; each
 >   match is handled by type (archive → streamed, directory → recursed, file → processed). Quote the pattern so your shell
 >   passes it through to the client unexpanded.
 > - **S3** (requires `pip install "grobid-client-python[s3]"`): pass an `s3://` object, prefix or glob. A remote zip is
 >   **range-streamed** (only its central directory and the entries are fetched — never the whole object); loose remote
->   PDFs are fetched a batch at a time. Credentials use the standard AWS chain (env vars / `~/.aws` / IAM role).
+>   PDFs are fetched a batch at a time, directly into memory without being written to a local file first. Credentials use
+>   the standard AWS chain (env vars / `~/.aws` / IAM role).
 >   ```bash
 >   grobid_client --input "s3://my-bucket/papers/2021.zip"  --output ~/out processFulltextDocument   # one remote zip
 >   grobid_client --input "s3://my-bucket/pdfs/*.pdf"        --output ~/out processFulltextDocument   # loose PDFs
@@ -288,6 +290,63 @@ client.process(
     output_path="/path/to/output"
 )
 ```
+
+#### Processing a PDF from memory
+
+A PDF that is already in memory - downloaded from an API, read from a database or an object store - can be sent
+directly, without writing it to a temporary file first. `process_pdf` takes either a path or the document itself, as
+`bytes` or as any binary stream, and returns the TEI as a string:
+
+```python
+import io
+import requests
+
+pdf = io.BytesIO(requests.get("https://example.org/paper.pdf").content)
+pdf.name = "paper.pdf"          # optional, see below
+
+name, status, tei = client.process_pdf(
+    service="processFulltextDocument",
+    pdf_file=pdf,
+    consolidate_header=True,
+    tei_coordinates=True
+)
+
+if status == 200:
+    print(tei)
+```
+
+There is no flag to say where the document comes from: the object itself says it. A document also carries its own name,
+taken from the `name` attribute that `open()` sets on files and that can be set on anything else, `io.BytesIO` included.
+The name identifies the document in the request sent to GROBID, in the logs, and as the first element of the result, so
+documents processed this way stay distinguishable. Bytes passed on their own have nothing to be named after and fall
+back to `document.pdf`.
+
+Several documents can be sent concurrently with `process_documents`, which runs them through the same thread pool the
+file-based processing uses:
+
+```python
+results = client.process_documents(
+    service="processFulltextDocument",
+    documents=[pdf1, pdf2, "/path/to/paper3.pdf"],
+    n=10                            # documents sent concurrently
+)
+
+for name, status, tei in results:
+    ...
+```
+
+Documents that do not name themselves are named `document-1.pdf`, `document-2.pdf`, ... after their position. Results
+come back **in the order the documents were given**, not in completion order, so they can be zipped back onto whatever
+the caller has them keyed by. A document that fails does not stop the others: its own entry carries the error status.
+
+Before an in-memory run starts (this includes archive and `s3://` streaming), the client asks the server's `/api/health`
+how many engines it actually has and logs a warning when the requested concurrency `n` exceeds them - the surplus
+requests would only queue on the server or bounce as 503 - and an info message when engines would sit idle. The check is
+advisory: a server without the endpoint (older GROBID) never blocks the run.
+
+> [!NOTE]
+> Both return the TEI instead of writing it to disk, so the caller decides what to do with it. Use `process()` for the
+> directory-oriented processing with resume and JSON/Markdown conversion.
 
 ### Standalone Conversion Tools
 
